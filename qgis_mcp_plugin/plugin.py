@@ -390,7 +390,7 @@ class QgisMCPServer(QObject):
                 "QgsCoordinateReferenceSystem": QgsCoordinateReferenceSystem,
             }
 
-            exec(code, namespace)
+            exec(code, namespace)  # nosec B102 — intentional: MCP execute_code tool
 
             return {
                 "executed": True,
