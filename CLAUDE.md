@@ -10,25 +10,25 @@ QGIS MCP (v0.1.0) connects QGIS to Claude AI through the Model Context Protocol 
 
 The system has two components that communicate over a TCP socket (default `localhost:9876`, configurable via env vars):
 
-1. **QGIS Plugin** (`qgis_mcp_plugin/qgis_mcp_plugin.py`) — Runs inside QGIS (3.28–4.x). A `QgisMCPServer` class creates a non-blocking TCP socket server using a `QTimer` (25ms poll interval) to accept connections and process JSON commands within QGIS's event loop. Includes a `QgisMCPDockWidget` UI for start/stop control, and `QgisMCPPlugin` as the standard QGIS plugin entry point (`classFactory`). All command handlers live in this file. A companion `compat.py` module provides enum compatibility between QGIS 3.x and 4.x (see below).
+1. **QGIS Plugin** (`qgis_mcp_plugin/plugin.py`) — Runs inside QGIS (3.28–4.x). A `QgisMCPServer` class creates a non-blocking TCP socket server using a `QTimer` (25ms poll interval) to accept connections and process JSON commands within QGIS's event loop. Includes a `QgisMCPDockWidget` UI for start/stop control, and `QgisMCPPlugin` as the standard QGIS plugin entry point (`classFactory`). All command handlers live in this file. A companion `compat.py` module provides enum compatibility between QGIS 3.x and 4.x (see below).
 
-2. **MCP Server** (`src/qgis_mcp/qgis_mcp_server.py`) — Runs outside QGIS as a standalone Python process. Uses `FastMCP` from the `mcp` library to expose QGIS operations as MCP tools, resources, and prompts. A `_send()` helper unwraps the response envelope and raises on errors. All 50 tools are `async` with `title=` for human-readable names. Uses `ToolAnnotations` for read-only/destructive/idempotent hints. Long-running tools use `ctx.info()` for MCP logging. Destructive tools use `ctx.elicit()` for user confirmation (with graceful fallback).
+2. **MCP Server** (`src/qgis_mcp/server.py`) — Runs outside QGIS as a standalone Python process. Uses `FastMCP` from the `mcp` library to expose QGIS operations as MCP tools, resources, and prompts. A `_send()` helper unwraps the response envelope and raises on errors. All 50 tools are `async` with `title=` for human-readable names. Uses `ToolAnnotations` for read-only/destructive/idempotent hints. Long-running tools use `ctx.info()` for MCP logging. Destructive tools use `ctx.elicit()` for user confirmation (with graceful fallback).
 
 **Data flow:** Claude → MCP Server (FastMCP) → TCP socket → QGIS Plugin (QTimer loop) → PyQGIS API → response back through socket.
 
-There is also a standalone socket client at `src/qgis_mcp/qgis_socket_client.py` (`QgisMCPClient` class) used for direct testing without MCP.
+There is also a standalone socket client at `src/qgis_mcp/client.py` (`QgisMCPClient` class) used for direct testing without MCP.
 
 ## Commands
 
 ```bash
 # Run the MCP server (how Claude Desktop launches it)
-uv run --no-sync src/qgis_mcp/qgis_mcp_server.py
+uv run --no-sync src/qgis_mcp/server.py
 
 # Run with custom host/port
-QGIS_MCP_HOST=192.168.1.100 QGIS_MCP_PORT=9877 uv run --no-sync src/qgis_mcp/qgis_mcp_server.py
+QGIS_MCP_HOST=192.168.1.100 QGIS_MCP_PORT=9877 uv run --no-sync src/qgis_mcp/server.py
 
 # Run with streamable HTTP transport (for remote/multi-client)
-QGIS_MCP_TRANSPORT=streamable-http uv run --no-sync src/qgis_mcp/qgis_mcp_server.py
+QGIS_MCP_TRANSPORT=streamable-http uv run --no-sync src/qgis_mcp/server.py
 
 # Run unit tests (no QGIS needed - mocked socket)
 uv run --no-sync pytest tests/test_mcp_tools.py -v

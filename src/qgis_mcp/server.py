@@ -23,7 +23,7 @@ from mcp.types import (
     ToolAnnotations,
 )
 
-from qgis_mcp.qgis_socket_client import QgisMCPClient
+from qgis_mcp.client import QgisMCPClient
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
