@@ -86,6 +86,8 @@ from .compat import (
 class QgisMCPServer(QObject):
     """Server class to handle socket connections and execute QGIS commands"""
 
+    MAX_CLIENTS: ClassVar[int] = 10
+
     def __init__(self, host="localhost", port=9876, iface=None):
         super().__init__()
         self.host = host
@@ -93,8 +95,7 @@ class QgisMCPServer(QObject):
         self.iface = iface
         self.running = False
         self.socket = None
-        self.client = None
-        self.buffer = b""
+        self.clients: dict[socket.socket, bytes] = {}
         self.timer = None
         self._message_log = deque(maxlen=1000)
 
@@ -106,7 +107,7 @@ class QgisMCPServer(QObject):
 
         try:
             self.socket.bind((self.host, self.port))
-            self.socket.listen(1)
+            self.socket.listen(5)
             self.socket.setblocking(False)
 
             self.timer = QTimer()
@@ -136,18 +137,29 @@ class QgisMCPServer(QObject):
 
         if self.socket:
             self.socket.close()
-        if self.client:
-            self.client.close()
+        for client_sock in list(self.clients):
+            with contextlib.suppress(Exception):
+                client_sock.close()
+        self.clients.clear()
 
         self.socket = None
-        self.client = None
         QgsMessageLog.logMessage("QGIS MCP server stopped", "QGIS MCP")
 
-    def _send_response(self, response):
-        """Send a length-prefixed JSON response to the client."""
+    def _disconnect_client(self, client_sock, message="Client disconnected", level=None):
+        """Close and remove a client socket."""
+        with contextlib.suppress(Exception):
+            client_sock.close()
+        self.clients.pop(client_sock, None)
+        log_args = [f"{message} ({len(self.clients)} active)", "QGIS MCP"]
+        if level is not None:
+            log_args.append(level)
+        QgsMessageLog.logMessage(*log_args)
+
+    def _send_response(self, client_sock, response):
+        """Send a length-prefixed JSON response to a client."""
         resp_bytes = json.dumps(response).encode("utf-8")
         header = struct.pack(">I", len(resp_bytes))
-        self.client.sendall(header + resp_bytes)
+        client_sock.sendall(header + resp_bytes)
 
     def process_server(self):
         """Process server operations (called by timer)"""
@@ -155,61 +167,54 @@ class QgisMCPServer(QObject):
             return
 
         try:
-            # Accept new connections
-            if not self.client and self.socket:
+            # Accept new connections (loop until no pending or at capacity)
+            if self.socket:
+                while len(self.clients) < self.MAX_CLIENTS:
+                    try:
+                        client_sock, address = self.socket.accept()
+                        client_sock.setblocking(False)
+                        self.clients[client_sock] = b""
+                        QgsMessageLog.logMessage(
+                            f"Connected to client: {address} ({len(self.clients)} active)",
+                            "QGIS MCP",
+                        )
+                    except BlockingIOError:
+                        break
+                    except Exception as e:
+                        QgsMessageLog.logMessage(
+                            f"Error accepting connection: {e!s}", "QGIS MCP", MSG_WARNING
+                        )
+                        break
+
+            # Process each connected client
+            for client_sock in list(self.clients):
                 try:
-                    self.client, address = self.socket.accept()
-                    self.client.setblocking(False)
-                    QgsMessageLog.logMessage(f"Connected to client: {address}", "QGIS MCP")
+                    data = client_sock.recv(65536)
+                    if data:
+                        buf = self.clients[client_sock] + data
+                        if len(buf) > 10 * 1024 * 1024:
+                            raise ValueError("Buffer exceeded 10 MB limit")
+                        # Process complete length-prefixed messages
+                        while len(buf) >= 4:
+                            msg_len = struct.unpack(">I", buf[:4])[0]
+                            if msg_len > 10 * 1024 * 1024:  # 10 MB limit
+                                raise ValueError(f"Message too large: {msg_len} bytes")
+                            if len(buf) < 4 + msg_len:
+                                break  # Incomplete message
+                            msg_bytes = buf[4:4 + msg_len]
+                            buf = buf[4 + msg_len:]
+                            command = json.loads(msg_bytes.decode("utf-8"))
+                            response = self.execute_command(command)
+                            self._send_response(client_sock, response)
+                        self.clients[client_sock] = buf
+                    else:
+                        self._disconnect_client(client_sock)
                 except BlockingIOError:
                     pass
                 except Exception as e:
-                    QgsMessageLog.logMessage(
-                        f"Error accepting connection: {e!s}", "QGIS MCP", MSG_WARNING
+                    self._disconnect_client(
+                        client_sock, f"Error with client: {e!s}", MSG_WARNING
                     )
-
-            # Process existing connection
-            if self.client:
-                try:
-                    try:
-                        data = self.client.recv(65536)
-                        if data:
-                            if len(self.buffer) + len(data) > 10 * 1024 * 1024:
-                                raise ValueError("Buffer exceeded 10 MB limit")
-                            self.buffer += data
-                            # Process complete length-prefixed messages
-                            while len(self.buffer) >= 4:
-                                msg_len = struct.unpack(">I", self.buffer[:4])[0]
-                                if msg_len > 10 * 1024 * 1024:  # 10 MB limit
-                                    raise ValueError(f"Message too large: {msg_len} bytes")
-                                if len(self.buffer) < 4 + msg_len:
-                                    break  # Incomplete message
-                                msg_bytes = self.buffer[4:4 + msg_len]
-                                self.buffer = self.buffer[4 + msg_len:]
-                                command = json.loads(msg_bytes.decode("utf-8"))
-                                response = self.execute_command(command)
-                                self._send_response(response)
-                        else:
-                            QgsMessageLog.logMessage("Client disconnected", "QGIS MCP")
-                            self.client.close()
-                            self.client = None
-                            self.buffer = b""
-                    except BlockingIOError:
-                        pass
-                    except Exception as e:
-                        QgsMessageLog.logMessage(
-                            f"Error receiving data: {e!s}", "QGIS MCP", MSG_WARNING
-                        )
-                        self.client.close()
-                        self.client = None
-                        self.buffer = b""
-
-                except Exception as e:
-                    QgsMessageLog.logMessage(f"Error with client: {e!s}", "QGIS MCP", MSG_WARNING)
-                    if self.client:
-                        self.client.close()
-                        self.client = None
-                    self.buffer = b""
 
         except Exception as e:
             QgsMessageLog.logMessage(f"Server error: {e!s}", "QGIS MCP", MSG_CRITICAL)
