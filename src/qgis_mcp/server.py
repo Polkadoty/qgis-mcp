@@ -108,21 +108,14 @@ def _send_sync(command_type: str, params: dict | None = None, timeout: int = 30)
     to QGIS. This handles the common case where the cached connection went
     stale (e.g. QGIS plugin restarted, idle TCP timeout).
     """
-    qgis = get_qgis_connection()
-    result = qgis.send_command(command_type, params, timeout=timeout)
-
-    # Detect connection errors returned as error dicts by send_command
-    if result and result.get("status") == "error":
-        msg = result.get("message", "")
-        is_conn_error = any(
-            pattern in msg
-            for pattern in ("Broken pipe", "Connection reset", "Connection refused", "Connection closed")
-        )
-        if is_conn_error:
-            logger.warning("Connection error (%s), reconnecting and retrying", msg)
-            _invalidate_connection()
-            qgis = get_qgis_connection()
-            result = qgis.send_command(command_type, params, timeout=timeout)
+    try:
+        qgis = get_qgis_connection()
+        result = qgis.send_command(command_type, params, timeout=timeout)
+    except _CONNECTION_ERRORS as exc:
+        logger.warning("Connection error (%s), reconnecting and retrying", exc)
+        _invalidate_connection()
+        qgis = get_qgis_connection()
+        result = qgis.send_command(command_type, params, timeout=timeout)
 
     if not result or result.get("status") == "error":
         raise RuntimeError(result.get("message", "Command failed") if result else "No response")

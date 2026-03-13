@@ -100,6 +100,8 @@ class QgisMCPClient:
         except TimeoutError:
             logger.warning("Socket operation timed out after %ds", timeout)
             return {"status": "error", "message": "Connection timed out"}
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, ConnectionError):
+            raise  # Let callers handle reconnection
         except Exception as e:
             logger.exception("Error sending command")
             return {"status": "error", "message": str(e)}

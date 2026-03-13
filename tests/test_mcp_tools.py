@@ -80,6 +80,42 @@ def test_send_empty_result(mock_connection):
     assert result == {}
 
 
+def test_send_retries_on_broken_pipe():
+    """When send_command raises BrokenPipeError, _send_sync reconnects and retries."""
+    first_client = MagicMock(spec=QgisMCPClient)
+    first_client.socket = MagicMock()
+    first_client.socket.getpeername.return_value = ("localhost", 9876)
+    first_client.send_command.side_effect = BrokenPipeError("[Errno 32] Broken pipe")
+
+    second_client = MagicMock(spec=QgisMCPClient)
+    second_client.socket = MagicMock()
+    second_client.socket.getpeername.return_value = ("localhost", 9876)
+    second_client.send_command.return_value = {"status": "success", "result": {"pong": True}}
+
+    with patch("qgis_mcp.server.get_qgis_connection", side_effect=[first_client, second_client]):
+        with patch("qgis_mcp.server._invalidate_connection"):
+            result = _send_sync("ping")
+
+    assert result == {"pong": True}
+    first_client.send_command.assert_called_once()
+    second_client.send_command.assert_called_once()
+
+
+def test_send_raises_after_retry_fails():
+    """When both attempts raise connection errors, the second propagates."""
+    client = MagicMock(spec=QgisMCPClient)
+    client.socket = MagicMock()
+    client.socket.getpeername.return_value = ("localhost", 9876)
+    client.send_command.side_effect = ConnectionResetError("Connection reset")
+
+    with patch("qgis_mcp.server.get_qgis_connection", return_value=client):
+        with patch("qgis_mcp.server._invalidate_connection"):
+            with pytest.raises(ConnectionResetError):
+                _send_sync("ping")
+
+    assert client.send_command.call_count == 2
+
+
 # --- Tool-level tests (all async) ---
 
 
