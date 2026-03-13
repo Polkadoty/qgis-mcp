@@ -75,6 +75,7 @@ from .compat import (
     LAYER_VECTOR,
     LAYOUT_SUCCESS,
     MSG_CRITICAL,
+    MSG_INFO,
     MSG_WARNING,
     PROCESSING_OPTIONAL,
     RASTER_STATS_ALL,
@@ -86,6 +87,7 @@ from .compat import (
 class QgisMCPServer(QObject):
     """Server class to handle socket connections and execute QGIS commands"""
 
+    LOG_TAG: ClassVar[str] = "MCP"
     MAX_CLIENTS: ClassVar[int] = 10
 
     def __init__(self, host="localhost", port=9876, iface=None):
@@ -116,11 +118,11 @@ class QgisMCPServer(QObject):
 
             QgsApplication.messageLog().messageReceived.connect(self._capture_message)
             QgsMessageLog.logMessage(
-                f"QGIS MCP server started on {self.host}:{self.port}", "QGIS MCP"
+                f"QGIS MCP server started on {self.host}:{self.port}", self.LOG_TAG, MSG_INFO
             )
             return True
         except Exception as e:
-            QgsMessageLog.logMessage(f"Failed to start server: {e!s}", "QGIS MCP", MSG_CRITICAL)
+            QgsMessageLog.logMessage(f"Failed to start server: {e!s}", self.LOG_TAG, MSG_CRITICAL)
             self.stop()
             return False
 
@@ -143,17 +145,14 @@ class QgisMCPServer(QObject):
         self.clients.clear()
 
         self.socket = None
-        QgsMessageLog.logMessage("QGIS MCP server stopped", "QGIS MCP")
+        QgsMessageLog.logMessage("QGIS MCP server stopped", self.LOG_TAG, MSG_INFO)
 
-    def _disconnect_client(self, client_sock, message="Client disconnected", level=None):
+    def _disconnect_client(self, client_sock, message="Client disconnected", level=MSG_INFO):
         """Close and remove a client socket."""
         with contextlib.suppress(Exception):
             client_sock.close()
         self.clients.pop(client_sock, None)
-        log_args = [f"{message} ({len(self.clients)} active)", "QGIS MCP"]
-        if level is not None:
-            log_args.append(level)
-        QgsMessageLog.logMessage(*log_args)
+        QgsMessageLog.logMessage(f"{message} ({len(self.clients)} active)", self.LOG_TAG, level)
 
     def _send_response(self, client_sock, response):
         """Send a length-prefixed JSON response to a client."""
@@ -176,13 +175,14 @@ class QgisMCPServer(QObject):
                         self.clients[client_sock] = b""
                         QgsMessageLog.logMessage(
                             f"Connected to client: {address} ({len(self.clients)} active)",
-                            "QGIS MCP",
+                            self.LOG_TAG,
+                            MSG_INFO,
                         )
                     except BlockingIOError:
                         break
                     except Exception as e:
                         QgsMessageLog.logMessage(
-                            f"Error accepting connection: {e!s}", "QGIS MCP", MSG_WARNING
+                            f"Error accepting connection: {e!s}", self.LOG_TAG, MSG_WARNING
                         )
                         break
 
@@ -203,7 +203,12 @@ class QgisMCPServer(QObject):
                                 break  # Incomplete message
                             msg_bytes = buf[4:4 + msg_len]
                             buf = buf[4 + msg_len:]
-                            command = json.loads(msg_bytes.decode("utf-8"))
+                            try:
+                                command = json.loads(msg_bytes.decode("utf-8"))
+                            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                                QgsMessageLog.logMessage(f"Malformed request: {e!s}", self.LOG_TAG, MSG_WARNING)
+                                self._send_response(client_sock, {"status": "error", "message": f"Invalid JSON: {e!s}"})
+                                continue
                             response = self.execute_command(command)
                             self._send_response(client_sock, response)
                         self.clients[client_sock] = buf
@@ -217,7 +222,7 @@ class QgisMCPServer(QObject):
                     )
 
         except Exception as e:
-            QgsMessageLog.logMessage(f"Server error: {e!s}", "QGIS MCP", MSG_CRITICAL)
+            QgsMessageLog.logMessage(f"Server error: {e!s}", self.LOG_TAG, MSG_CRITICAL)
 
     def execute_command(self, command):
         """Execute a command"""
@@ -286,18 +291,18 @@ class QgisMCPServer(QObject):
             handler = handlers.get(cmd_type)
             if handler:
                 try:
-                    QgsMessageLog.logMessage(f"Executing handler for {cmd_type}", "QGIS MCP")
+                    QgsMessageLog.logMessage(f"Executing: {cmd_type}", self.LOG_TAG, MSG_INFO)
                     result = handler(**params)
-                    QgsMessageLog.logMessage("Handler execution complete", "QGIS MCP")
                     return {"status": "success", "result": result}
                 except Exception as e:
-                    QgsMessageLog.logMessage(f"Error in handler: {e!s}", "QGIS MCP", MSG_CRITICAL)
+                    QgsMessageLog.logMessage(f"Error in {cmd_type}: {e!s}", self.LOG_TAG, MSG_CRITICAL)
                     return {"status": "error", "message": str(e)}
             else:
+                QgsMessageLog.logMessage(f"Unknown command: {cmd_type}", self.LOG_TAG, MSG_WARNING)
                 return {"status": "error", "message": f"Unknown command type: {cmd_type}"}
 
         except Exception as e:
-            QgsMessageLog.logMessage(f"Error executing command: {e!s}", "QGIS MCP", MSG_CRITICAL)
+            QgsMessageLog.logMessage(f"Error executing command: {e!s}", self.LOG_TAG, MSG_CRITICAL)
             return {"status": "error", "message": str(e)}
 
     # -----------------------------------------------------------------------
@@ -376,6 +381,7 @@ class QgisMCPServer(QObject):
             return None
 
     def execute_code(self, code, **kwargs):
+        QgsMessageLog.logMessage(f"Executing code ({len(code)} chars)", self.LOG_TAG, MSG_INFO)
         stdout_capture = io.StringIO()
         stderr_capture = io.StringIO()
         original_stdout = sys.stdout
@@ -424,6 +430,7 @@ class QgisMCPServer(QObject):
             raise Exception(f"Layer is not valid: {path}")
 
         QgsProject.instance().addMapLayer(layer)
+        QgsMessageLog.logMessage(f"Vector layer added: {name}", self.LOG_TAG, MSG_INFO)
 
         return {
             "id": layer.id(),
@@ -441,6 +448,7 @@ class QgisMCPServer(QObject):
             raise Exception(f"Layer is not valid: {path}")
 
         QgsProject.instance().addMapLayer(layer)
+        QgsMessageLog.logMessage(f"Raster layer added: {name}", self.LOG_TAG, MSG_INFO)
 
         return {
             "id": layer.id(),
@@ -479,7 +487,9 @@ class QgisMCPServer(QObject):
     def remove_layer(self, layer_id, **kwargs):
         project = QgsProject.instance()
         if layer_id in project.mapLayers():
+            layer_name = project.mapLayer(layer_id).name()
             project.removeMapLayer(layer_id)
+            QgsMessageLog.logMessage(f"Layer removed: {layer_name}", self.LOG_TAG, MSG_INFO)
             return {"ok": True}
         else:
             raise Exception(f"Layer not found: {layer_id}")
@@ -705,7 +715,7 @@ class QgisMCPServer(QObject):
                 )
             except Exception as e:
                 QgsMessageLog.logMessage(
-                    f"Could not compute stats for band {band}: {e}", "QGIS MCP", MSG_WARNING
+                    f"Could not compute stats for band {band}: {e}", self.LOG_TAG, MSG_WARNING
                 )
             nodata = dp.sourceNoDataValue(band)
             if nodata is not None:
@@ -791,6 +801,7 @@ class QgisMCPServer(QObject):
         try:
             import processing
 
+            QgsMessageLog.logMessage(f"Processing: {algorithm}", self.LOG_TAG, MSG_INFO)
             result = processing.run(algorithm, parameters)
             return {"algorithm": algorithm, "result": {k: str(v) for k, v in result.items()}}
         except Exception as e:
@@ -804,6 +815,7 @@ class QgisMCPServer(QObject):
 
         save_path = path if path else project.fileName()
         if project.write(save_path):
+            QgsMessageLog.logMessage(f"Project saved: {save_path}", self.LOG_TAG, MSG_INFO)
             return {"saved": save_path}
         else:
             raise Exception(f"Failed to save project to {save_path}")
@@ -812,6 +824,7 @@ class QgisMCPServer(QObject):
         project = QgsProject.instance()
         if project.read(path):
             self.iface.mapCanvas().refresh()
+            QgsMessageLog.logMessage(f"Project loaded: {path}", self.LOG_TAG, MSG_INFO)
             return {"loaded": path, "layer_count": len(project.mapLayers())}
         else:
             raise Exception(f"Failed to load project from {path}")
@@ -823,6 +836,7 @@ class QgisMCPServer(QObject):
         project.setFileName(path)
         self.iface.mapCanvas().refresh()
         if project.write():
+            QgsMessageLog.logMessage(f"Project created: {path}", self.LOG_TAG, MSG_INFO)
             return {
                 "created": f"Project created and saved successfully at: {path}",
                 "layer_count": len(project.mapLayers()),

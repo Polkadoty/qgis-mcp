@@ -32,6 +32,11 @@ except AttributeError:
 
 # ── Message levels ───────────────────────────────────────────────────
 try:
+    MSG_INFO = Qgis.MessageLevel.Info
+except AttributeError:
+    MSG_INFO = Qgis.Info
+
+try:
     MSG_WARNING = Qgis.MessageLevel.Warning
 except AttributeError:
     MSG_WARNING = Qgis.Warning
