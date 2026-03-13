@@ -98,24 +98,40 @@ def _invalidate_connection() -> None:
         _connection_validated_at = 0.0
 
 
-_CONNECTION_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, ConnectionError)
+_CONNECTION_ERRORS = (OSError, ConnectionError)
+_MAX_RETRIES = 3
+_RETRY_DELAYS = (0.5, 1.0)  # seconds between retries (last retry has no delay after)
 
 
 def _send_sync(command_type: str, params: dict | None = None, timeout: int = 30) -> dict:
     """Send a command synchronously and return the unwrapped result.
 
-    Retries once on connection errors (broken pipe, reset) by reconnecting
-    to QGIS. This handles the common case where the cached connection went
-    stale (e.g. QGIS plugin restarted, idle TCP timeout).
+    Retries up to _MAX_RETRIES times on connection/socket errors with
+    increasing delays. This handles:
+    - Stale cached connections (QGIS plugin restarted, idle TCP timeout)
+    - QGIS plugin not ready yet when MCP server starts (race on first call)
     """
-    try:
-        qgis = get_qgis_connection()
-        result = qgis.send_command(command_type, params, timeout=timeout)
-    except _CONNECTION_ERRORS as exc:
-        logger.warning("Connection error (%s), reconnecting and retrying", exc)
-        _invalidate_connection()
-        qgis = get_qgis_connection()
-        result = qgis.send_command(command_type, params, timeout=timeout)
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            qgis = get_qgis_connection()
+            result = qgis.send_command(command_type, params, timeout=timeout)
+            break
+        except _CONNECTION_ERRORS as exc:
+            last_exc = exc
+            _invalidate_connection()
+            if attempt < _MAX_RETRIES - 1:
+                delay = _RETRY_DELAYS[min(attempt, len(_RETRY_DELAYS) - 1)]
+                logger.warning(
+                    "Connection error (%s), retrying in %.1fs (attempt %d/%d)",
+                    exc, delay, attempt + 1, _MAX_RETRIES,
+                )
+                time.sleep(delay)
+            else:
+                logger.error("Connection failed after %d attempts: %s", _MAX_RETRIES, exc)
+                raise
+    else:
+        raise last_exc  # type: ignore[misc]  # unreachable, but satisfies type checker
 
     if not result or result.get("status") == "error":
         raise RuntimeError(result.get("message", "Command failed") if result else "No response")

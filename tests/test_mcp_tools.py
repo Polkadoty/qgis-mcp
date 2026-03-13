@@ -94,7 +94,8 @@ def test_send_retries_on_broken_pipe():
 
     with patch("qgis_mcp.server.get_qgis_connection", side_effect=[first_client, second_client]):
         with patch("qgis_mcp.server._invalidate_connection"):
-            result = _send_sync("ping")
+            with patch("qgis_mcp.server.time.sleep"):
+                result = _send_sync("ping")
 
     assert result == {"pong": True}
     first_client.send_command.assert_called_once()
@@ -102,7 +103,7 @@ def test_send_retries_on_broken_pipe():
 
 
 def test_send_raises_after_retry_fails():
-    """When both attempts raise connection errors, the second propagates."""
+    """When all retry attempts raise connection errors, the last propagates."""
     client = MagicMock(spec=QgisMCPClient)
     client.socket = MagicMock()
     client.socket.getpeername.return_value = ("localhost", 9876)
@@ -110,10 +111,11 @@ def test_send_raises_after_retry_fails():
 
     with patch("qgis_mcp.server.get_qgis_connection", return_value=client):
         with patch("qgis_mcp.server._invalidate_connection"):
-            with pytest.raises(ConnectionResetError):
-                _send_sync("ping")
+            with patch("qgis_mcp.server.time.sleep"):
+                with pytest.raises(ConnectionResetError):
+                    _send_sync("ping")
 
-    assert client.send_command.call_count == 2
+    assert client.send_command.call_count == 3  # 3 attempts with backoff
 
 
 # --- Tool-level tests (all async) ---
