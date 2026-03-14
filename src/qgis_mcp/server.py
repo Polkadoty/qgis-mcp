@@ -8,9 +8,11 @@ import contextlib
 import json
 import logging
 import os
+import sys
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from logging.handlers import RotatingFileHandler
 from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -20,17 +22,55 @@ from mcp.types import (
     Completion,
     CompletionArgument,
     ImageContent,
-    ResourceLink,
-    TextContent,
     ToolAnnotations,
 )
 
 from qgis_mcp.client import QgisMCPClient
-
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+from qgis_mcp.helpers import (
+    BATCH_BLOCKED_COMMANDS,
+    enrich_diagnose,
+    make_layer_response,
+    make_project_response,
+    make_render_response,
 )
-logger = logging.getLogger("QgisMCPServer")
+
+
+def _setup_logging() -> logging.Logger:
+    """Configure structured logging with stderr + optional rotating file handler."""
+    _logger = logging.getLogger("QgisMCPServer")
+    _logger.handlers.clear()
+
+    fmt = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
+    # stderr handler at WARNING+ to keep MCP stdio transport clean
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setLevel(logging.WARNING)
+    stderr_handler.setFormatter(fmt)
+    _logger.addHandler(stderr_handler)
+
+    # File handler (configurable via env vars)
+    _default_log_file = os.path.join("~", ".local", "share", "qgis-mcp", "server.log")
+    log_file_raw = os.environ.get("QGIS_MCP_LOG_FILE", _default_log_file)
+    log_level_name = os.environ.get("QGIS_MCP_LOG_LEVEL", "INFO").upper()
+    file_level = getattr(logging, log_level_name, logging.INFO)
+
+    if log_file_raw != "":
+        log_file = os.path.expanduser(log_file_raw)
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        file_handler = RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=3)
+        file_handler.setLevel(file_level)
+        file_handler.setFormatter(fmt)
+        _logger.addHandler(file_handler)
+        # Set logger level to the minimum of both handler levels
+        _logger.setLevel(min(logging.WARNING, file_level))
+        _logger.info(f"Log file: {log_file}")
+    else:
+        _logger.setLevel(logging.WARNING)
+
+    return _logger
+
+
+logger = _setup_logging()
 
 
 # ---------------------------------------------------------------------------
@@ -72,8 +112,8 @@ def get_qgis_connection() -> QgisMCPClient:
         port = int(port_str)
         if not 1 <= port <= 65535:
             raise ValueError("out of range")
-    except ValueError:
-        raise ValueError(f"QGIS_MCP_PORT must be an integer 1-65535, got: {port_str!r}")
+    except ValueError as exc:
+        raise ValueError(f"QGIS_MCP_PORT must be an integer 1-65535, got: {port_str!r}") from exc
     _qgis_connection = QgisMCPClient(host=host, port=port)
     if not _qgis_connection.connect():
         _qgis_connection = None
@@ -101,34 +141,50 @@ def _invalidate_connection() -> None:
 _CONNECTION_ERRORS = (OSError, ConnectionError)
 _MAX_RETRIES = 3
 _RETRY_DELAYS = (0.5, 1.0)  # seconds between retries (last retry has no delay after)
+# First-connect retries: more patient since QGIS/plugin may still be starting
+_FIRST_CONNECT_RETRIES = 5
+_FIRST_CONNECT_DELAYS = (1.0, 2.0, 3.0, 5.0)  # escalating backoff
+_first_successful_connection = False
 
 
 def _send_sync(command_type: str, params: dict | None = None, timeout: int = 30) -> dict:
     """Send a command synchronously and return the unwrapped result.
 
-    Retries up to _MAX_RETRIES times on connection/socket errors with
-    increasing delays. This handles:
-    - Stale cached connections (QGIS plugin restarted, idle TCP timeout)
-    - QGIS plugin not ready yet when MCP server starts (race on first call)
+    Retries on connection/socket errors with increasing delays. Uses a more
+    patient retry schedule for the first connection (QGIS may still be starting),
+    then shorter retries for subsequent reconnections (stale socket, plugin restart).
     """
+    global _first_successful_connection
     last_exc: Exception | None = None
-    for attempt in range(_MAX_RETRIES):
+
+    if _first_successful_connection:
+        max_retries = _MAX_RETRIES
+        delays = _RETRY_DELAYS
+    else:
+        max_retries = _FIRST_CONNECT_RETRIES
+        delays = _FIRST_CONNECT_DELAYS
+
+    for attempt in range(max_retries):
         try:
             qgis = get_qgis_connection()
             result = qgis.send_command(command_type, params, timeout=timeout)
+            _first_successful_connection = True
             break
         except _CONNECTION_ERRORS as exc:
             last_exc = exc
             _invalidate_connection()
-            if attempt < _MAX_RETRIES - 1:
-                delay = _RETRY_DELAYS[min(attempt, len(_RETRY_DELAYS) - 1)]
+            if attempt < max_retries - 1:
+                delay = delays[min(attempt, len(delays) - 1)]
                 logger.warning(
                     "Connection error (%s), retrying in %.1fs (attempt %d/%d)",
-                    exc, delay, attempt + 1, _MAX_RETRIES,
+                    exc,
+                    delay,
+                    attempt + 1,
+                    max_retries,
                 )
                 time.sleep(delay)
             else:
-                logger.error("Connection failed after %d attempts: %s", _MAX_RETRIES, exc)
+                logger.error("Connection failed after %d attempts: %s", max_retries, exc)
                 raise
     else:
         raise last_exc  # type: ignore[misc]  # unreachable, but satisfies type checker
@@ -184,14 +240,16 @@ async def _confirm_destructive(ctx: Context, message: str) -> bool:
 
 @asynccontextmanager
 async def server_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
-    """Manage server startup and shutdown lifecycle."""
+    """Manage server startup and shutdown lifecycle.
+
+    Uses lazy connection: does NOT connect to QGIS on startup.
+    The first tool call triggers connection via _send_sync()'s retry loop,
+    which is more robust (handles QGIS still starting, plugin not yet enabled).
+    """
+    host = os.environ.get("QGIS_MCP_HOST", "localhost")
+    port = os.environ.get("QGIS_MCP_PORT", "9876")
+    logger.info(f"QgisMCPServer starting up (will connect to QGIS at {host}:{port} on first call)")
     try:
-        logger.info("QgisMCPServer starting up")
-        try:
-            get_qgis_connection()
-            logger.info("Successfully connected to QGIS on startup")
-        except Exception as e:
-            logger.warning(f"Could not connect to QGIS on startup: {e}")
         yield {}
     finally:
         if _qgis_connection:
@@ -209,7 +267,7 @@ mcp = FastMCP(
 
 
 # ===========================================================================
-# MCP TOOLS (50 total)
+# MCP TOOLS (51 total)
 # ===========================================================================
 
 # --- Connectivity & Info ---
@@ -223,6 +281,20 @@ mcp = FastMCP(
 )
 async def ping(ctx: Context) -> dict[str, Any]:
     return await _send("ping")
+
+
+@mcp.tool(
+    title="Diagnose",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    description="Run diagnostic checks on the QGIS MCP stack. Reports QGIS version, "
+    "plugin/server version match, processing providers, connected clients, and project status.",
+    structured_output=True,
+)
+async def diagnose(ctx: Context) -> dict[str, Any]:
+    """Check health of the full MCP ↔ QGIS chain."""
+    await ctx.info("Running diagnostics...")
+    result = await _send("diagnose")
+    return enrich_diagnose(result)
 
 
 @mcp.tool(
@@ -252,14 +324,7 @@ async def get_project_info(ctx: Context) -> dict[str, Any]:
 async def load_project(ctx: Context, path: str) -> list:
     await ctx.info(f"Loading project: {path}")
     result = await _send("load_project", {"path": path})
-    return [
-        TextContent(type="text", text=json.dumps(result)),
-        ResourceLink(
-            type="resource_link",
-            uri="qgis://project",
-            name="Project Info",
-        ),
-    ]
+    return make_project_response(result)
 
 
 @mcp.tool(
@@ -268,14 +333,7 @@ async def load_project(ctx: Context, path: str) -> list:
 )
 async def create_new_project(ctx: Context, path: str) -> list:
     result = await _send("create_new_project", {"path": path})
-    return [
-        TextContent(type="text", text=json.dumps(result)),
-        ResourceLink(
-            type="resource_link",
-            uri="qgis://project",
-            name="Project Info",
-        ),
-    ]
+    return make_project_response(result)
 
 
 @mcp.tool(
@@ -315,15 +373,7 @@ async def add_vector_layer(
     if name:
         params["name"] = name
     result = await _send("add_vector_layer", params)
-    layer_id = result.get("layer_id", result.get("id", ""))
-    return [
-        TextContent(type="text", text=json.dumps(result)),
-        ResourceLink(
-            type="resource_link",
-            uri=f"qgis://layers/{layer_id}/info",
-            name=result.get("name", "Layer"),
-        ),
-    ]
+    return make_layer_response(result)
 
 
 @mcp.tool(
@@ -336,15 +386,7 @@ async def add_raster_layer(
     if name:
         params["name"] = name
     result = await _send("add_raster_layer", params)
-    layer_id = result.get("layer_id", result.get("id", ""))
-    return [
-        TextContent(type="text", text=json.dumps(result)),
-        ResourceLink(
-            type="resource_link",
-            uri=f"qgis://layers/{layer_id}/info",
-            name=result.get("name", "Layer"),
-        ),
-    ]
+    return make_layer_response(result)
 
 
 @mcp.tool(
@@ -386,15 +428,7 @@ async def create_memory_layer(
     if fields:
         params["fields"] = fields
     result = await _send("create_memory_layer", params)
-    layer_id = result.get("layer_id", result.get("id", ""))
-    return [
-        TextContent(type="text", text=json.dumps(result)),
-        ResourceLink(
-            type="resource_link",
-            uri=f"qgis://layers/{layer_id}/info",
-            name=result.get("name", name),
-        ),
-    ]
+    return make_layer_response(result, fallback_name=name)
 
 
 # --- Layer Visibility & Navigation ---
@@ -705,23 +739,7 @@ async def render_map(
     result = await _send("render_map_base64", params, timeout=60)
     await ctx.report_progress(100, 100)
 
-    content = [
-        ImageContent(
-            type="image",
-            data=result["base64_data"],
-            mimeType="image/png",
-            annotations=Annotations(audience=["user", "assistant"], priority=1.0),
-        )
-    ]
-    if path:
-        content.append(
-            TextContent(
-                type="text",
-                text=json.dumps({"saved": path, "width": width, "height": height}),
-                annotations=Annotations(audience=["assistant"], priority=0.5),
-            )
-        )
-    return content
+    return make_render_response(result, width, height, path)
 
 
 # --- Code Execution ---
@@ -745,16 +763,206 @@ async def execute_code(ctx: Context, code: str) -> dict:
     return result
 
 
+# --- High-Value Capabilities ---
+
+
+@mcp.tool(
+    title="Get Active Layer",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    description="Get the currently active (selected) layer in the QGIS layer panel.",
+    structured_output=True,
+)
+async def get_active_layer(ctx: Context) -> dict[str, Any]:
+    return await _send("get_active_layer")
+
+
+@mcp.tool(
+    title="Set Active Layer",
+    annotations=ToolAnnotations(idempotentHint=True),
+    description="Set the active layer in the QGIS layer panel by layer ID.",
+)
+async def set_active_layer(ctx: Context, layer_id: str) -> dict:
+    return await _send("set_active_layer", {"layer_id": layer_id})
+
+
+@mcp.tool(
+    title="Get Canvas Scale",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    description="Get the current map canvas scale, rotation, and magnification factor.",
+    structured_output=True,
+)
+async def get_canvas_scale(ctx: Context) -> dict[str, Any]:
+    return await _send("get_canvas_scale")
+
+
+@mcp.tool(
+    title="Set Canvas Scale",
+    annotations=ToolAnnotations(idempotentHint=True),
+    description="Set the map canvas scale and/or rotation. Provide scale as denominator "
+    "(e.g. 50000 for 1:50000). Rotation in degrees (0-360).",
+)
+async def set_canvas_scale(
+    ctx: Context, scale: float | None = None, rotation: float | None = None
+) -> dict:
+    params: dict[str, Any] = {}
+    if scale is not None:
+        params["scale"] = scale
+    if rotation is not None:
+        params["rotation"] = rotation
+    return await _send("set_canvas_scale", params)
+
+
+@mcp.tool(
+    title="Get Layer Labeling",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    description="Get the labeling configuration of a vector layer: enabled state, field, font size, color.",
+    structured_output=True,
+)
+async def get_layer_labeling(ctx: Context, layer_id: str) -> dict[str, Any]:
+    return await _send("get_layer_labeling", {"layer_id": layer_id})
+
+
+@mcp.tool(
+    title="Set Layer Labeling",
+    description="Configure labeling for a vector layer. Set enabled=false to disable labels. "
+    "Set field_name to the attribute field to label with. Optional: font_size (float), "
+    "color (hex like '#000000').",
+)
+async def set_layer_labeling(
+    ctx: Context,
+    layer_id: str,
+    enabled: bool = True,
+    field_name: str | None = None,
+    font_size: float | None = None,
+    color: str | None = None,
+) -> dict:
+    params: dict[str, Any] = {"layer_id": layer_id, "enabled": enabled}
+    if field_name is not None:
+        params["field_name"] = field_name
+    if font_size is not None:
+        params["font_size"] = font_size
+    if color is not None:
+        params["color"] = color
+    return await _send("set_layer_labeling", params)
+
+
+@mcp.tool(
+    title="Get Layer CRS",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    description="Get the coordinate reference system (CRS) of a layer: EPSG code, description, "
+    "whether geographic, and PROJ4 string.",
+    structured_output=True,
+)
+async def get_layer_crs(ctx: Context, layer_id: str) -> dict[str, Any]:
+    return await _send("get_layer_crs", {"layer_id": layer_id})
+
+
+@mcp.tool(
+    title="Set Layer CRS",
+    description="Set the CRS of a layer (e.g. 'EPSG:4326'). This does NOT reproject data — "
+    "it only changes how the layer's coordinates are interpreted.",
+)
+async def set_layer_crs(ctx: Context, layer_id: str, crs: str) -> dict:
+    return await _send("set_layer_crs", {"layer_id": layer_id, "crs": crs})
+
+
+@mcp.tool(
+    title="Get Bookmarks",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    description="Get spatial bookmarks from the project. Each bookmark has a name, group, "
+    "extent (xmin/ymin/xmax/ymax), and CRS.",
+    structured_output=True,
+)
+async def get_bookmarks(ctx: Context) -> dict[str, Any]:
+    return await _send("get_bookmarks")
+
+
+@mcp.tool(
+    title="Add Bookmark",
+    description="Add a spatial bookmark to the project for quick navigation. "
+    "Provide a name and extent (xmin/ymin/xmax/ymax) with CRS.",
+)
+async def add_bookmark(
+    ctx: Context,
+    name: str,
+    xmin: float,
+    ymin: float,
+    xmax: float,
+    ymax: float,
+    crs: str = "EPSG:4326",
+    group: str = "",
+) -> dict:
+    return await _send(
+        "add_bookmark",
+        {
+            "name": name,
+            "xmin": xmin,
+            "ymin": ymin,
+            "xmax": xmax,
+            "ymax": ymax,
+            "crs": crs,
+            "group": group,
+        },
+    )
+
+
+@mcp.tool(
+    title="Remove Bookmark",
+    annotations=ToolAnnotations(destructiveHint=True),
+    description="Remove a spatial bookmark by its ID.",
+)
+async def remove_bookmark(ctx: Context, bookmark_id: str) -> dict:
+    return await _send("remove_bookmark", {"bookmark_id": bookmark_id})
+
+
+@mcp.tool(
+    title="Get Map Themes",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    description="Get map themes (visibility presets). Each theme stores which layers are visible.",
+    structured_output=True,
+)
+async def get_map_themes(ctx: Context) -> dict[str, Any]:
+    return await _send("get_map_themes")
+
+
+@mcp.tool(
+    title="Add Map Theme",
+    description="Create a map theme from the current layer visibility state. "
+    "If a theme with this name exists, it will be updated.",
+)
+async def add_map_theme(ctx: Context, name: str) -> dict:
+    return await _send("add_map_theme", {"name": name})
+
+
+@mcp.tool(
+    title="Remove Map Theme",
+    annotations=ToolAnnotations(destructiveHint=True),
+    description="Remove a map theme by name.",
+)
+async def remove_map_theme(ctx: Context, name: str) -> dict:
+    return await _send("remove_map_theme", {"name": name})
+
+
+@mcp.tool(
+    title="Apply Map Theme",
+    annotations=ToolAnnotations(idempotentHint=True),
+    description="Apply a map theme — restores the layer visibility state saved in the theme.",
+)
+async def apply_map_theme(ctx: Context, name: str) -> dict:
+    return await _send("apply_map_theme", {"name": name})
+
+
+@mcp.tool(
+    title="Set Project CRS",
+    description="Set the project coordinate reference system (e.g. 'EPSG:4326', 'EPSG:3857'). "
+    "This changes how layers are projected on the map canvas.",
+)
+async def set_project_crs(ctx: Context, crs: str) -> list:
+    result = await _send("set_project_crs", {"crs": crs})
+    return make_project_response(result)
+
+
 # --- Batch ---
-
-
-_BATCH_BLOCKED_COMMANDS = frozenset({
-    "execute_code",
-    "remove_layer",
-    "delete_features",
-    "set_setting",
-    "reload_plugin",
-})
 
 
 @mcp.tool(
@@ -767,7 +975,7 @@ _BATCH_BLOCKED_COMMANDS = frozenset({
 async def batch_commands(ctx: Context, commands: list[dict]) -> dict:
     for cmd in commands:
         cmd_type = cmd.get("type", "")
-        if cmd_type in _BATCH_BLOCKED_COMMANDS:
+        if cmd_type in BATCH_BLOCKED_COMMANDS:
             raise ValueError(
                 f"Command {cmd_type!r} is not allowed in batch — "
                 "call it individually so confirmation can be requested"
@@ -956,7 +1164,9 @@ async def set_project_variable(ctx: Context, key: str, value: str) -> dict:
     "and referenced column names. Optionally test against a layer's fields.",
     structured_output=True,
 )
-async def validate_expression(ctx: Context, expression: str, layer_id: str | None = None) -> dict[str, Any]:
+async def validate_expression(
+    ctx: Context, expression: str, layer_id: str | None = None
+) -> dict[str, Any]:
     params = {"expression": expression}
     if layer_id:
         params["layer_id"] = layer_id
@@ -1016,6 +1226,20 @@ async def transform_coordinates(
     if bbox:
         params["bbox"] = bbox
     return await _send("transform_coordinates", params)
+
+
+# ---------------------------------------------------------------------------
+# Compound tool mode (opt-in via QGIS_MCP_TOOL_MODE=compound)
+# ---------------------------------------------------------------------------
+
+_tool_mode = os.environ.get("QGIS_MCP_TOOL_MODE", "granular")
+if _tool_mode == "compound":
+    from qgis_mcp.compound_tools import register_compound_tools
+
+    # Replace granular tools with compound tools
+    mcp._tool_manager._tools.clear()
+    register_compound_tools(mcp, _send, _confirm_destructive)
+    logger.info(f"Compound tool mode: {len(mcp._tool_manager._tools)} tools registered")
 
 
 # ===========================================================================
@@ -1118,17 +1342,18 @@ def llms_context_resource() -> str:
 
 ## Overview
 QGIS MCP connects QGIS Desktop to LLMs via the Model Context Protocol.
-50 tools for project management, layer operations, feature editing, styling, processing, and more.
+51 tools for project management, layer operations, feature editing, styling, processing, and more.
 
 ## Quick Start
 1. `ping` — verify connectivity
-2. `get_project_info` — understand current project
-3. `get_layers` — list available layers
-4. `get_layer_features` — inspect data (expression filtering, pagination)
-5. `render_map` or `get_canvas_screenshot` — see the map
+2. `diagnose` — check full stack health (versions, providers, clients)
+3. `get_project_info` — understand current project
+4. `get_layers` — list available layers
+5. `get_layer_features` — inspect data (expression filtering, pagination)
+6. `render_map` or `get_canvas_screenshot` — see the map
 
 ## Tool Categories
-- **Info**: ping, get_qgis_info, get_project_info
+- **Info**: ping, diagnose, get_qgis_info, get_project_info
 - **Project**: load_project, create_new_project, save_project
 - **Layers**: get_layers, add_vector_layer, add_raster_layer, remove_layer, find_layer, create_memory_layer
 - **Visibility**: set_layer_visibility, zoom_to_layer
@@ -1159,6 +1384,7 @@ QGIS MCP connects QGIS Desktop to LLMs via the Model Context Protocol.
 - Processing algorithms: search with list_processing_algorithms, get params with get_algorithm_help
 - render_map returns inline images; get_canvas_screenshot is faster (no re-render)
 - Destructive operations (remove_layer, delete_features, set_setting) may ask for confirmation
+- Use diagnose to troubleshoot connection or version issues
 
 ## Resources (read-only data)
 - qgis://info — QGIS version info
@@ -1173,6 +1399,9 @@ QGIS MCP connects QGIS Desktop to LLMs via the Model Context Protocol.
 - QGIS_MCP_HOST — server host (default: localhost)
 - QGIS_MCP_PORT — server port (default: 9876)
 - QGIS_MCP_TRANSPORT — "stdio" (default) or "streamable-http"
+- QGIS_MCP_TOOL_MODE — "granular" (default, 51 tools) or "compound" (~19 grouped tools)
+- QGIS_MCP_LOG_FILE — log file path (default: ~/.local/share/qgis-mcp/server.log)
+- QGIS_MCP_LOG_LEVEL — file log level (default: INFO)
 """
 
 
@@ -1238,6 +1467,7 @@ def style_map_prompt(layer_id: str, field: str) -> list[UserMessage]:
 # ===========================================================================
 # Entry point
 # ===========================================================================
+
 
 def main():
     transport = os.environ.get("QGIS_MCP_TRANSPORT", "stdio")

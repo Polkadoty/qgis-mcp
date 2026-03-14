@@ -48,6 +48,7 @@ from qgis.PyQt.QtCore import QBuffer, QByteArray, QObject, QSize, QTimer, QUrl, 
 from qgis.PyQt.QtGui import QColor, QDesktopServices, QIcon
 from qgis.PyQt.QtWidgets import (
     QAction,
+    QCheckBox,
     QDialog,
     QHBoxLayout,
     QLabel,
@@ -201,13 +202,18 @@ class QgisMCPServer(QObject):
                                 raise ValueError(f"Message too large: {msg_len} bytes")
                             if len(buf) < 4 + msg_len:
                                 break  # Incomplete message
-                            msg_bytes = buf[4:4 + msg_len]
-                            buf = buf[4 + msg_len:]
+                            msg_bytes = buf[4 : 4 + msg_len]
+                            buf = buf[4 + msg_len :]
                             try:
                                 command = json.loads(msg_bytes.decode("utf-8"))
                             except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                                QgsMessageLog.logMessage(f"Malformed request: {e!s}", self.LOG_TAG, MSG_WARNING)
-                                self._send_response(client_sock, {"status": "error", "message": f"Invalid JSON: {e!s}"})
+                                QgsMessageLog.logMessage(
+                                    f"Malformed request: {e!s}", self.LOG_TAG, MSG_WARNING
+                                )
+                                self._send_response(
+                                    client_sock,
+                                    {"status": "error", "message": f"Invalid JSON: {e!s}"},
+                                )
                                 continue
                             response = self.execute_command(command)
                             self._send_response(client_sock, response)
@@ -217,9 +223,7 @@ class QgisMCPServer(QObject):
                 except BlockingIOError:
                     pass
                 except Exception as e:
-                    self._disconnect_client(
-                        client_sock, f"Error with client: {e!s}", MSG_WARNING
-                    )
+                    self._disconnect_client(client_sock, f"Error with client: {e!s}", MSG_WARNING)
 
         except Exception as e:
             QgsMessageLog.logMessage(f"Server error: {e!s}", self.LOG_TAG, MSG_CRITICAL)
@@ -286,6 +290,24 @@ class QgisMCPServer(QObject):
                 # Phase 4 — MCP modernization
                 "get_canvas_screenshot": self.get_canvas_screenshot,
                 "transform_coordinates": self.transform_coordinates,
+                "diagnose": self.diagnose,
+                # Phase 5 — High-value capabilities
+                "get_active_layer": self.get_active_layer,
+                "set_active_layer": self.set_active_layer,
+                "get_canvas_scale": self.get_canvas_scale,
+                "set_canvas_scale": self.set_canvas_scale,
+                "get_layer_labeling": self.get_layer_labeling,
+                "set_layer_labeling": self.set_layer_labeling,
+                "get_layer_crs": self.get_layer_crs,
+                "set_layer_crs": self.set_layer_crs,
+                "get_bookmarks": self.get_bookmarks,
+                "add_bookmark": self.add_bookmark,
+                "remove_bookmark": self.remove_bookmark,
+                "get_map_themes": self.get_map_themes,
+                "add_map_theme": self.add_map_theme,
+                "remove_map_theme": self.remove_map_theme,
+                "apply_map_theme": self.apply_map_theme,
+                "set_project_crs": self.set_project_crs,
             }
 
             handler = handlers.get(cmd_type)
@@ -295,7 +317,9 @@ class QgisMCPServer(QObject):
                     result = handler(**params)
                     return {"status": "success", "result": result}
                 except Exception as e:
-                    QgsMessageLog.logMessage(f"Error in {cmd_type}: {e!s}", self.LOG_TAG, MSG_CRITICAL)
+                    QgsMessageLog.logMessage(
+                        f"Error in {cmd_type}: {e!s}", self.LOG_TAG, MSG_CRITICAL
+                    )
                     return {"status": "error", "message": str(e)}
             else:
                 QgsMessageLog.logMessage(f"Unknown command: {cmd_type}", self.LOG_TAG, MSG_WARNING)
@@ -311,6 +335,71 @@ class QgisMCPServer(QObject):
 
     def ping(self, **kwargs):
         return {"pong": True}
+
+    def diagnose(self, **kwargs):
+        """Run diagnostic checks and return health status."""
+        checks = []
+        overall = "healthy"
+
+        # 1. QGIS info
+        try:
+            from qgis.PyQt.QtCore import QT_VERSION_STR as qt_ver
+
+            info = {
+                "qgis_version": Qgis.version(),
+                "python_version": sys.version.split()[0],
+                "qt_version": qt_ver,
+            }
+            checks.append({"name": "qgis", "status": "ok", "detail": info})
+        except Exception as e:
+            checks.append({"name": "qgis", "status": "error", "detail": str(e)})
+            overall = "error"
+
+        # 2. Plugin version
+        try:
+            import configparser
+
+            metadata_path = os.path.join(os.path.dirname(__file__), "metadata.txt")
+            config = configparser.ConfigParser()
+            config.read(metadata_path)
+            plugin_version = config.get("general", "version", fallback="unknown")
+            checks.append({"name": "plugin_version", "status": "ok", "detail": plugin_version})
+        except Exception as e:
+            checks.append({"name": "plugin_version", "status": "error", "detail": str(e)})
+            overall = "degraded" if overall == "healthy" else overall
+
+        # 3. Connected clients
+        client_count = len(self.clients)
+        checks.append({"name": "connected_clients", "status": "ok", "detail": client_count})
+
+        # 4. Processing providers
+        try:
+            registry = QgsApplication.processingRegistry()
+            providers = [p.id() for p in registry.providers() if p.isActive()]
+            checks.append({"name": "processing_providers", "status": "ok", "detail": providers})
+        except Exception as e:
+            checks.append({"name": "processing_providers", "status": "degraded", "detail": str(e)})
+            overall = "degraded" if overall == "healthy" else overall
+
+        # 5. Project status
+        try:
+            project = QgsProject.instance()
+            checks.append(
+                {
+                    "name": "project",
+                    "status": "ok",
+                    "detail": {
+                        "loaded": bool(project.fileName()),
+                        "path": project.fileName() or None,
+                        "layer_count": len(project.mapLayers()),
+                    },
+                }
+            )
+        except Exception as e:
+            checks.append({"name": "project", "status": "error", "detail": str(e)})
+            overall = "degraded" if overall == "healthy" else overall
+
+        return {"status": overall, "checks": checks}
 
     def get_qgis_info(self, **kwargs):
         return {
@@ -331,15 +420,14 @@ class QgisMCPServer(QObject):
         }
 
         layers = list(project.mapLayers().values())
-        for i, layer in enumerate(layers):
-            if i >= 10:
-                break
+        for layer in layers[:10]:
             layer_info = {
                 "id": layer.id(),
                 "name": layer.name(),
                 "type": self._get_layer_type(layer),
-                "visible": (layer.isValid()
-                            and project.layerTreeRoot().findLayer(layer.id()).isVisible()),
+                "visible": (
+                    layer.isValid() and project.layerTreeRoot().findLayer(layer.id()).isVisible()
+                ),
             }
             info["layers"].append(layer_info)
 
@@ -462,7 +550,7 @@ class QgisMCPServer(QObject):
         project = QgsProject.instance()
         all_layers = list(project.mapLayers().items())
         total_count = len(all_layers)
-        page = all_layers[offset:offset + limit]
+        page = all_layers[offset : offset + limit]
 
         layers = []
         for layer_id, layer in page:
@@ -541,40 +629,26 @@ class QgisMCPServer(QObject):
                 geom = feature.geometry()
                 geom_type = geom.type()
 
-                try:
-                    wkb_type_name = QgsWkbTypes.displayString(geom.wkbType())
+                wkb_type_name = QgsWkbTypes.displayString(geom.wkbType())
 
-                    if geom_type in [GEOM_POLYGON, GEOM_LINE]:
-                        simplified_geom = geom.simplify(0.001)
-                        points_count = len(simplified_geom.asWkt().split(","))
-                        geom_obj = {
-                            "type": geom_type,
-                            "wkb_type": wkb_type_name,
-                            "wkt_summary": f"{wkb_type_name} with {points_count} points",
-                            "bbox": [
-                                geom.boundingBox().xMinimum(),
-                                geom.boundingBox().yMinimum(),
-                                geom.boundingBox().xMaximum(),
-                                geom.boundingBox().yMaximum(),
-                            ],
-                        }
-                    else:
-                        geom_obj = {
-                            "type": geom_type,
-                            "wkb_type": wkb_type_name,
-                            "wkt": geom.asWkt(precision=3),
-                        }
-                except ImportError:
+                if geom_type in [GEOM_POLYGON, GEOM_LINE]:
+                    simplified_geom = geom.simplify(0.001)
+                    points_count = len(simplified_geom.asWkt().split(","))
                     geom_obj = {
                         "type": geom_type,
+                        "wkb_type": wkb_type_name,
+                        "wkt_summary": f"{wkb_type_name} with {points_count} points",
                         "bbox": [
                             geom.boundingBox().xMinimum(),
                             geom.boundingBox().yMinimum(),
                             geom.boundingBox().xMaximum(),
                             geom.boundingBox().yMaximum(),
-                        ]
-                        if hasattr(geom, "boundingBox")
-                        else None,
+                        ],
+                    }
+                else:
+                    geom_obj = {
+                        "type": geom_type,
+                        "wkb_type": wkb_type_name,
                         "wkt": geom.asWkt(precision=3),
                     }
 
@@ -1072,8 +1146,10 @@ class QgisMCPServer(QObject):
                 continue
             if search:
                 search_lower = search.lower()
-                if (search_lower not in alg.id().lower() and
-                        search_lower not in alg.displayName().lower()):
+                if (
+                    search_lower not in alg.id().lower()
+                    and search_lower not in alg.displayName().lower()
+                ):
                     continue
             algorithms.append(
                 {
@@ -1447,11 +1523,231 @@ class QgisMCPServer(QObject):
 
         return result
 
+    # -----------------------------------------------------------------------
+    # Phase 5 — High-value capability handlers
+    # -----------------------------------------------------------------------
+
+    def get_active_layer(self, **kwargs):
+        """Get the currently active (selected) layer in the layer panel."""
+        layer = self.iface.activeLayer()
+        if not layer:
+            return {"active": False, "layer_id": None, "name": None, "type": None}
+        return {
+            "active": True,
+            "layer_id": layer.id(),
+            "name": layer.name(),
+            "type": self._get_layer_type(layer),
+        }
+
+    def set_active_layer(self, layer_id, **kwargs):
+        """Set the active layer by ID."""
+        project = QgsProject.instance()
+        layer = project.mapLayer(layer_id)
+        if not layer:
+            raise ValueError(f"Layer not found: {layer_id}")
+        self.iface.setActiveLayer(layer)
+        return {"ok": True, "layer_id": layer_id, "name": layer.name()}
+
+    def get_canvas_scale(self, **kwargs):
+        """Get map canvas scale, rotation, and magnification."""
+        canvas = self.iface.mapCanvas()
+        return {
+            "scale": canvas.scale(),
+            "rotation": canvas.rotation(),
+            "magnification": canvas.magnificationFactor(),
+        }
+
+    def set_canvas_scale(self, scale=None, rotation=None, **kwargs):
+        """Set map canvas scale and/or rotation."""
+        canvas = self.iface.mapCanvas()
+        if scale is not None:
+            canvas.zoomScale(scale)
+        if rotation is not None:
+            canvas.setRotation(rotation)
+        canvas.refresh()
+        return {
+            "ok": True,
+            "scale": canvas.scale(),
+            "rotation": canvas.rotation(),
+        }
+
+    def get_layer_labeling(self, layer_id, **kwargs):
+        """Get labeling configuration for a vector layer."""
+        layer = self._get_vector_layer(layer_id)
+        result = {
+            "layer_id": layer_id,
+            "enabled": layer.labelsEnabled(),
+        }
+        labeling = layer.labeling()
+        if labeling:
+            settings = labeling.settings()
+            result["field_name"] = settings.fieldName
+            result["is_expression"] = settings.isExpression
+            result["font_size"] = settings.format().size()
+            result["color"] = settings.format().color().name()
+            result["placement"] = str(settings.placement)
+        return result
+
+    def set_layer_labeling(self, layer_id, enabled=True, field_name=None, font_size=None, color=None, **kwargs):
+        """Configure labeling for a vector layer."""
+        from qgis.core import QgsPalLayerSettings, QgsTextFormat, QgsVectorLayerSimpleLabeling
+
+        layer = self._get_vector_layer(layer_id)
+
+        if not enabled:
+            layer.setLabelsEnabled(False)
+            layer.triggerRepaint()
+            return {"ok": True, "layer_id": layer_id, "enabled": False}
+
+        settings = QgsPalLayerSettings()
+        if field_name:
+            settings.fieldName = field_name
+            settings.isExpression = False
+
+        text_format = QgsTextFormat()
+        if font_size:
+            text_format.setSize(font_size)
+        if color:
+            text_format.setColor(QColor(color))
+        settings.setFormat(text_format)
+
+        labeling = QgsVectorLayerSimpleLabeling(settings)
+        layer.setLabeling(labeling)
+        layer.setLabelsEnabled(True)
+        layer.triggerRepaint()
+        return {"ok": True, "layer_id": layer_id, "enabled": True, "field_name": field_name}
+
+    def get_layer_crs(self, layer_id, **kwargs):
+        """Get the CRS of a layer."""
+        project = QgsProject.instance()
+        layer = project.mapLayer(layer_id)
+        if not layer:
+            raise ValueError(f"Layer not found: {layer_id}")
+        crs = layer.crs()
+        return {
+            "layer_id": layer_id,
+            "authid": crs.authid(),
+            "description": crs.description(),
+            "is_geographic": crs.isGeographic(),
+            "proj4": crs.toProj4(),
+        }
+
+    def set_layer_crs(self, layer_id, crs, **kwargs):
+        """Set the CRS of a layer."""
+        project = QgsProject.instance()
+        layer = project.mapLayer(layer_id)
+        if not layer:
+            raise ValueError(f"Layer not found: {layer_id}")
+        new_crs = QgsCoordinateReferenceSystem(crs)
+        if not new_crs.isValid():
+            raise ValueError(f"Invalid CRS: {crs}")
+        layer.setCrs(new_crs)
+        return {"ok": True, "layer_id": layer_id, "crs": new_crs.authid()}
+
+    def get_bookmarks(self, **kwargs):
+        """Get spatial bookmarks from the project."""
+        bm = QgsProject.instance().bookmarkManager()
+        bookmarks = []
+        for b in bm.bookmarks():
+            extent = b.extent()
+            bookmarks.append({
+                "id": b.id(),
+                "name": b.name(),
+                "group": b.group(),
+                "extent": {
+                    "xmin": extent.xMinimum(),
+                    "ymin": extent.yMinimum(),
+                    "xmax": extent.xMaximum(),
+                    "ymax": extent.yMaximum(),
+                },
+                "crs": extent.crs().authid() if extent.crs().isValid() else None,
+            })
+        return {"bookmarks": bookmarks, "count": len(bookmarks)}
+
+    def add_bookmark(self, name, xmin, ymin, xmax, ymax, crs="EPSG:4326", group="", **kwargs):
+        """Add a spatial bookmark to the project."""
+        from qgis.core import QgsBookmark, QgsReferencedRectangle
+
+        crs_obj = QgsCoordinateReferenceSystem(crs)
+        if not crs_obj.isValid():
+            raise ValueError(f"Invalid CRS: {crs}")
+        extent = QgsReferencedRectangle(QgsRectangle(xmin, ymin, xmax, ymax), crs_obj)
+        bookmark = QgsBookmark()
+        bookmark.setName(name)
+        bookmark.setGroup(group)
+        bookmark.setExtent(extent)
+        bookmark_id = QgsProject.instance().bookmarkManager().addBookmark(bookmark)
+        return {"ok": True, "id": bookmark_id, "name": name}
+
+    def remove_bookmark(self, bookmark_id, **kwargs):
+        """Remove a spatial bookmark by ID."""
+        bm = QgsProject.instance().bookmarkManager()
+        bm.removeBookmark(bookmark_id)
+        return {"ok": True, "id": bookmark_id}
+
+    def get_map_themes(self, **kwargs):
+        """Get map themes (visibility presets)."""
+        collection = QgsProject.instance().mapThemeCollection()
+        themes = collection.mapThemes()
+        result = []
+        for name in themes:
+            layer_ids = collection.mapThemeVisibleLayerIds(name)
+            result.append({
+                "name": name,
+                "visible_layer_count": len(layer_ids),
+                "visible_layer_ids": layer_ids,
+            })
+        return {"themes": result, "count": len(result)}
+
+    def add_map_theme(self, name, **kwargs):
+        """Create a map theme from the current layer visibility state."""
+        from qgis.core import QgsMapThemeCollection
+
+        collection = QgsProject.instance().mapThemeCollection()
+        root = QgsProject.instance().layerTreeRoot()
+        model = self.iface.layerTreeView().layerTreeModel()
+        record = QgsMapThemeCollection.createThemeFromCurrentState(root, model)
+        if collection.hasMapTheme(name):
+            collection.update(name, record)
+            return {"ok": True, "name": name, "action": "updated"}
+        else:
+            collection.insert(name, record)
+            return {"ok": True, "name": name, "action": "created"}
+
+    def remove_map_theme(self, name, **kwargs):
+        """Remove a map theme."""
+        collection = QgsProject.instance().mapThemeCollection()
+        if not collection.hasMapTheme(name):
+            raise ValueError(f"Map theme not found: {name}")
+        collection.removeMapTheme(name)
+        return {"ok": True, "name": name}
+
+    def apply_map_theme(self, name, **kwargs):
+        """Apply a map theme (restore its layer visibility state)."""
+        collection = QgsProject.instance().mapThemeCollection()
+        if not collection.hasMapTheme(name):
+            raise ValueError(f"Map theme not found: {name}")
+        root = QgsProject.instance().layerTreeRoot()
+        model = self.iface.layerTreeView().layerTreeModel()
+        collection.applyTheme(name, root, model)
+        self.iface.mapCanvas().refresh()
+        return {"ok": True, "name": name}
+
+    def set_project_crs(self, crs, **kwargs):
+        """Set the project CRS."""
+        new_crs = QgsCoordinateReferenceSystem(crs)
+        if not new_crs.isValid():
+            raise ValueError(f"Invalid CRS: {crs}")
+        QgsProject.instance().setCrs(new_crs)
+        return {"ok": True, "crs": new_crs.authid(), "description": new_crs.description()}
+
 
 class QgisMCPPlugin:
     """Main plugin class for QGIS MCP"""
 
     REPO_URL = "https://github.com/nkarasiak/qgis-mcp"
+
+    SETTINGS_PREFIX = "qgis_mcp"
 
     def __init__(self, iface):
         self.iface = iface
@@ -1480,6 +1776,7 @@ class QgisMCPPlugin:
         self.port_spin.setRange(1024, 65535)
         self.port_spin.setValue(9876)
         self.port_spin.setPrefix("Port: ")
+        self.port_spin.valueChanged.connect(self._save_port)
 
         port_widget = QWidget()
         port_layout = QHBoxLayout()
@@ -1490,8 +1787,26 @@ class QgisMCPPlugin:
         port_wa = QWidgetAction(self.iface.mainWindow())
         port_wa.setDefaultWidget(port_widget)
 
+        # Auto-start checkbox
+        self.autostart_cb = QCheckBox("Auto-start on startup")
+        settings = QgsSettings()
+        self.autostart_cb.setChecked(
+            settings.value(f"{self.SETTINGS_PREFIX}/autostart", False, type=bool)
+        )
+        self.autostart_cb.toggled.connect(self._save_autostart)
+
+        autostart_widget = QWidget()
+        autostart_layout = QHBoxLayout()
+        autostart_layout.setContentsMargins(6, 4, 6, 4)
+        autostart_layout.addWidget(self.autostart_cb)
+        autostart_widget.setLayout(autostart_layout)
+
+        autostart_wa = QWidgetAction(self.iface.mainWindow())
+        autostart_wa.setDefaultWidget(autostart_widget)
+
         menu = QMenu()
         menu.addAction(port_wa)
+        menu.addAction(autostart_wa)
 
         # Tool button with dropdown (like Plugin Reloader)
         self.tool_button = QToolButton()
@@ -1506,6 +1821,23 @@ class QgisMCPPlugin:
 
         self.iface.addPluginToMenu("QGIS MCP", self.action)
         self.iface.addPluginToMenu("QGIS MCP", self.help_action)
+
+        # Restore saved port
+        saved_port = settings.value(f"{self.SETTINGS_PREFIX}/port", 9876, type=int)
+        self.port_spin.setValue(saved_port)
+
+        # Auto-start if enabled
+        if self.autostart_cb.isChecked():
+            self.action.setChecked(True)
+            self.toggle_server(True)
+
+    def _save_autostart(self, checked):
+        """Persist auto-start preference."""
+        QgsSettings().setValue(f"{self.SETTINGS_PREFIX}/autostart", checked)
+
+    def _save_port(self, port):
+        """Persist port preference."""
+        QgsSettings().setValue(f"{self.SETTINGS_PREFIX}/port", port)
 
     def _green_logo_icon(self):
         """Load the green MCP logo for active state."""
@@ -1522,29 +1854,10 @@ class QgisMCPPlugin:
         label = QLabel(
             "<p>This plugin is only one half of the setup. You also need an "
             "<b>MCP server</b> so that Claude (or another LLM) can talk to QGIS.</p>"
-            "<h3>Claude Code (one-liner)</h3>"
-            "<pre>claude mcp add --transport stdio qgis-mcp \\\n"
-            f"  -- uvx --from git+{self.REPO_URL} \\\n"
-            "  qgis-mcp-server</pre>"
-            "<h3>Claude Desktop</h3>"
-            "<p>Add to your MCP config "
-            "(<code>Settings &gt; Developer &gt; Edit Config</code>):</p>"
-            '<pre>{\n'
-            '  "mcpServers": {\n'
-            '    "qgis": {\n'
-            '      "command": "uvx",\n'
-            '      "args": [\n'
-            '        "--from",\n'
-            f'        "git+{self.REPO_URL}",\n'
-            '        "qgis-mcp-server"\n'
-            "      ]\n"
-            "    }\n"
-            "  }\n"
-            "}</pre>"
-            "<p>Requires <a href=\"https://docs.astral.sh/uv/\">uv</a> "
-            "to be installed.</p>"
-            "<p>Full instructions on the "
-            f'<a href="{self.REPO_URL}">GitHub repository</a>.</p>'
+            "<p><b>Quick setup:</b> Run <code>python install.py</code> from the "
+            "repository root to configure your MCP client(s) automatically.</p>"
+            "<p>Full instructions are on the "
+            f'<a href="{self.REPO_URL}#installation">GitHub repository</a>.</p>'
         )
         label.setWordWrap(True)
         label.setOpenExternalLinks(True)
@@ -1553,9 +1866,7 @@ class QgisMCPPlugin:
         btn_layout = QHBoxLayout()
         github_btn = QToolButton()
         github_btn.setText("Open GitHub")
-        github_btn.clicked.connect(
-            lambda: QDesktopServices.openUrl(QUrl(self.REPO_URL))
-        )
+        github_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(self.REPO_URL)))
         btn_layout.addWidget(github_btn)
         btn_layout.addStretch()
         ok_btn = QToolButton()
@@ -1604,6 +1915,10 @@ class QgisMCPPlugin:
         if self._toolbar_action:
             self.iface.pluginToolBar().removeAction(self._toolbar_action)
             self._toolbar_action = None
+        if hasattr(self, "port_spin"):
+            self.port_spin.valueChanged.disconnect(self._save_port)
+        if hasattr(self, "autostart_cb"):
+            self.autostart_cb.toggled.disconnect(self._save_autostart)
 
 
 # Plugin entry point

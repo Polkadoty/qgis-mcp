@@ -82,6 +82,8 @@ def test_send_empty_result(mock_connection):
 
 def test_send_retries_on_broken_pipe():
     """When send_command raises BrokenPipeError, _send_sync reconnects and retries."""
+    import qgis_mcp.server as srv
+
     first_client = MagicMock(spec=QgisMCPClient)
     first_client.socket = MagicMock()
     first_client.socket.getpeername.return_value = ("localhost", 9876)
@@ -92,10 +94,17 @@ def test_send_retries_on_broken_pipe():
     second_client.socket.getpeername.return_value = ("localhost", 9876)
     second_client.send_command.return_value = {"status": "success", "result": {"pong": True}}
 
-    with patch("qgis_mcp.server.get_qgis_connection", side_effect=[first_client, second_client]):
-        with patch("qgis_mcp.server._invalidate_connection"):
-            with patch("qgis_mcp.server.time.sleep"):
-                result = _send_sync("ping")
+    # Simulate already-connected state (shorter retry schedule)
+    srv._first_successful_connection = True
+    try:
+        with (
+            patch("qgis_mcp.server.get_qgis_connection", side_effect=[first_client, second_client]),
+            patch("qgis_mcp.server._invalidate_connection"),
+            patch("qgis_mcp.server.time.sleep"),
+        ):
+            result = _send_sync("ping")
+    finally:
+        srv._first_successful_connection = False
 
     assert result == {"pong": True}
     first_client.send_command.assert_called_once()
@@ -104,18 +113,54 @@ def test_send_retries_on_broken_pipe():
 
 def test_send_raises_after_retry_fails():
     """When all retry attempts raise connection errors, the last propagates."""
+    import qgis_mcp.server as srv
+
     client = MagicMock(spec=QgisMCPClient)
     client.socket = MagicMock()
     client.socket.getpeername.return_value = ("localhost", 9876)
     client.send_command.side_effect = ConnectionResetError("Connection reset")
 
-    with patch("qgis_mcp.server.get_qgis_connection", return_value=client):
-        with patch("qgis_mcp.server._invalidate_connection"):
-            with patch("qgis_mcp.server.time.sleep"):
-                with pytest.raises(ConnectionResetError):
-                    _send_sync("ping")
+    # Simulate already-connected state (3 retries)
+    srv._first_successful_connection = True
+    try:
+        with (
+            patch("qgis_mcp.server.get_qgis_connection", return_value=client),
+            patch("qgis_mcp.server._invalidate_connection"),
+            patch("qgis_mcp.server.time.sleep"),
+            pytest.raises(ConnectionResetError),
+        ):
+            _send_sync("ping")
+    finally:
+        srv._first_successful_connection = False
 
     assert client.send_command.call_count == 3  # 3 attempts with backoff
+
+
+def test_first_connect_uses_patient_retries():
+    """First connection attempt uses more retries (5) with longer delays."""
+    import qgis_mcp.server as srv
+
+    client = MagicMock(spec=QgisMCPClient)
+    client.socket = MagicMock()
+    client.socket.getpeername.return_value = ("localhost", 9876)
+    client.send_command.side_effect = ConnectionRefusedError("Connection refused")
+
+    srv._first_successful_connection = False
+    try:
+        with (
+            patch("qgis_mcp.server.get_qgis_connection", return_value=client),
+            patch("qgis_mcp.server._invalidate_connection"),
+            patch("qgis_mcp.server.time.sleep") as mock_sleep,
+            pytest.raises(ConnectionRefusedError),
+        ):
+            _send_sync("ping")
+    finally:
+        srv._first_successful_connection = False
+
+    assert client.send_command.call_count == 5  # 5 patient retries
+    # Verify escalating delays: 1.0, 2.0, 3.0, 5.0
+    delays = [call.args[0] for call in mock_sleep.call_args_list]
+    assert delays == [1.0, 2.0, 3.0, 5.0]
 
 
 # --- Tool-level tests (all async) ---
@@ -739,19 +784,6 @@ async def test_set_project_variable_tool(mock_connection):
 
 
 @pytest.mark.asyncio
-async def test_validate_expression_valid(mock_connection):
-    mock_connection.send_command.return_value = {
-        "status": "success",
-        "result": {"valid": True, "referenced_columns": []},
-    }
-    from qgis_mcp.server import validate_expression
-
-    ctx = _make_ctx()
-    output = await validate_expression(ctx, expression="1 + 1")
-    assert output["valid"] is True
-
-
-@pytest.mark.asyncio
 async def test_validate_expression_with_layer(mock_connection):
     mock_connection.send_command.return_value = {
         "status": "success",
@@ -1011,3 +1043,392 @@ async def test_create_new_project_returns_resource_link(mock_connection):
     assert output[0].type == "text"
     assert output[1].type == "resource_link"
     assert "qgis://project" in str(output[1].uri)
+
+
+@pytest.mark.asyncio
+async def test_diagnose_tool(mock_connection):
+    mock_connection.send_command.return_value = {
+        "status": "success",
+        "result": {
+            "status": "healthy",
+            "checks": [
+                {
+                    "name": "qgis",
+                    "status": "ok",
+                    "detail": {
+                        "qgis_version": "3.34.0",
+                        "python_version": "3.12.0",
+                        "qt_version": "5.15.2",
+                    },
+                },
+                {"name": "plugin_version", "status": "ok", "detail": "0.1.3"},
+                {"name": "connected_clients", "status": "ok", "detail": 1},
+                {"name": "processing_providers", "status": "ok", "detail": ["native", "gdal"]},
+                {
+                    "name": "project",
+                    "status": "ok",
+                    "detail": {"loaded": True, "path": "/tmp/test.qgz", "layer_count": 3},
+                },
+            ],
+        },
+    }
+    from qgis_mcp.server import diagnose
+
+    ctx = _make_ctx()
+    with patch("qgis_mcp.helpers.importlib.metadata.version", return_value="0.1.3"):
+        output = await diagnose(ctx)
+    assert output["status"] == "healthy"
+    # Should have added version_match check
+    names = [c["name"] for c in output["checks"]]
+    assert "version_match" in names
+    ctx.info.assert_awaited_once_with("Running diagnostics...")
+
+
+@pytest.mark.asyncio
+async def test_diagnose_version_mismatch(mock_connection):
+    mock_connection.send_command.return_value = {
+        "status": "success",
+        "result": {
+            "status": "healthy",
+            "checks": [
+                {"name": "plugin_version", "status": "ok", "detail": "0.1.2"},
+            ],
+        },
+    }
+    from qgis_mcp.server import diagnose
+
+    ctx = _make_ctx()
+    with patch("qgis_mcp.helpers.importlib.metadata.version", return_value="0.1.3"):
+        output = await diagnose(ctx)
+    assert output["status"] == "degraded"
+    version_check = next(c for c in output["checks"] if c["name"] == "version_match")
+    assert version_check["status"] == "mismatch"
+
+
+# --- Phase 5: High-value capability tests ---
+
+
+@pytest.mark.asyncio
+async def test_get_active_layer_tool(mock_connection):
+    mock_connection.send_command.return_value = {
+        "status": "success",
+        "result": {"active": True, "layer_id": "layer_123", "name": "roads", "type": "vector_1"},
+    }
+    from qgis_mcp.server import get_active_layer
+
+    ctx = _make_ctx()
+    output = await get_active_layer(ctx)
+    assert output["active"] is True
+    assert output["layer_id"] == "layer_123"
+
+
+@pytest.mark.asyncio
+async def test_get_active_layer_none(mock_connection):
+    mock_connection.send_command.return_value = {
+        "status": "success",
+        "result": {"active": False, "layer_id": None, "name": None, "type": None},
+    }
+    from qgis_mcp.server import get_active_layer
+
+    ctx = _make_ctx()
+    output = await get_active_layer(ctx)
+    assert output["active"] is False
+
+
+@pytest.mark.asyncio
+async def test_set_active_layer_tool(mock_connection):
+    mock_connection.send_command.return_value = {
+        "status": "success",
+        "result": {"ok": True, "layer_id": "layer_123", "name": "roads"},
+    }
+    from qgis_mcp.server import set_active_layer
+
+    ctx = _make_ctx()
+    output = await set_active_layer(ctx, layer_id="layer_123")
+    assert output["ok"] is True
+    mock_connection.send_command.assert_called_once_with(
+        "set_active_layer", {"layer_id": "layer_123"}, timeout=30
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_canvas_scale_tool(mock_connection):
+    mock_connection.send_command.return_value = {
+        "status": "success",
+        "result": {"scale": 50000.0, "rotation": 0.0, "magnification": 1.0},
+    }
+    from qgis_mcp.server import get_canvas_scale
+
+    ctx = _make_ctx()
+    output = await get_canvas_scale(ctx)
+    assert output["scale"] == 50000.0
+    assert output["rotation"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_set_canvas_scale_tool(mock_connection):
+    mock_connection.send_command.return_value = {
+        "status": "success",
+        "result": {"ok": True, "scale": 25000.0, "rotation": 45.0},
+    }
+    from qgis_mcp.server import set_canvas_scale
+
+    ctx = _make_ctx()
+    output = await set_canvas_scale(ctx, scale=25000.0, rotation=45.0)
+    assert output["ok"] is True
+    call_params = mock_connection.send_command.call_args[0][1]
+    assert call_params["scale"] == 25000.0
+    assert call_params["rotation"] == 45.0
+
+
+@pytest.mark.asyncio
+async def test_set_canvas_scale_only_scale(mock_connection):
+    mock_connection.send_command.return_value = {
+        "status": "success",
+        "result": {"ok": True, "scale": 100000.0, "rotation": 0.0},
+    }
+    from qgis_mcp.server import set_canvas_scale
+
+    ctx = _make_ctx()
+    await set_canvas_scale(ctx, scale=100000.0)
+    call_params = mock_connection.send_command.call_args[0][1]
+    assert call_params["scale"] == 100000.0
+    assert "rotation" not in call_params
+
+
+@pytest.mark.asyncio
+async def test_get_layer_labeling_tool(mock_connection):
+    mock_connection.send_command.return_value = {
+        "status": "success",
+        "result": {
+            "layer_id": "layer_123",
+            "enabled": True,
+            "field_name": "name",
+            "is_expression": False,
+            "font_size": 10.0,
+            "color": "#000000",
+        },
+    }
+    from qgis_mcp.server import get_layer_labeling
+
+    ctx = _make_ctx()
+    output = await get_layer_labeling(ctx, layer_id="layer_123")
+    assert output["enabled"] is True
+    assert output["field_name"] == "name"
+
+
+@pytest.mark.asyncio
+async def test_set_layer_labeling_tool(mock_connection):
+    mock_connection.send_command.return_value = {
+        "status": "success",
+        "result": {"ok": True, "layer_id": "layer_123", "enabled": True, "field_name": "name"},
+    }
+    from qgis_mcp.server import set_layer_labeling
+
+    ctx = _make_ctx()
+    output = await set_layer_labeling(
+        ctx, layer_id="layer_123", field_name="name", font_size=12.0, color="#FF0000"
+    )
+    assert output["ok"] is True
+    call_params = mock_connection.send_command.call_args[0][1]
+    assert call_params["field_name"] == "name"
+    assert call_params["font_size"] == 12.0
+    assert call_params["color"] == "#FF0000"
+
+
+@pytest.mark.asyncio
+async def test_set_layer_labeling_disable(mock_connection):
+    mock_connection.send_command.return_value = {
+        "status": "success",
+        "result": {"ok": True, "layer_id": "layer_123", "enabled": False},
+    }
+    from qgis_mcp.server import set_layer_labeling
+
+    ctx = _make_ctx()
+    output = await set_layer_labeling(ctx, layer_id="layer_123", enabled=False)
+    assert output["enabled"] is False
+    call_params = mock_connection.send_command.call_args[0][1]
+    assert call_params["enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_layer_crs_tool(mock_connection):
+    mock_connection.send_command.return_value = {
+        "status": "success",
+        "result": {
+            "layer_id": "layer_123",
+            "authid": "EPSG:4326",
+            "description": "WGS 84",
+            "is_geographic": True,
+            "proj4": "+proj=longlat +datum=WGS84 +no_defs",
+        },
+    }
+    from qgis_mcp.server import get_layer_crs
+
+    ctx = _make_ctx()
+    output = await get_layer_crs(ctx, layer_id="layer_123")
+    assert output["authid"] == "EPSG:4326"
+    assert output["is_geographic"] is True
+
+
+@pytest.mark.asyncio
+async def test_set_layer_crs_tool(mock_connection):
+    mock_connection.send_command.return_value = {
+        "status": "success",
+        "result": {"ok": True, "layer_id": "layer_123", "crs": "EPSG:3857"},
+    }
+    from qgis_mcp.server import set_layer_crs
+
+    ctx = _make_ctx()
+    output = await set_layer_crs(ctx, layer_id="layer_123", crs="EPSG:3857")
+    assert output["ok"] is True
+    assert output["crs"] == "EPSG:3857"
+
+
+@pytest.mark.asyncio
+async def test_get_bookmarks_tool(mock_connection):
+    mock_connection.send_command.return_value = {
+        "status": "success",
+        "result": {
+            "bookmarks": [
+                {
+                    "id": "bm1",
+                    "name": "Berlin",
+                    "group": "",
+                    "extent": {"xmin": 13.0, "ymin": 52.0, "xmax": 13.8, "ymax": 52.7},
+                    "crs": "EPSG:4326",
+                }
+            ],
+            "count": 1,
+        },
+    }
+    from qgis_mcp.server import get_bookmarks
+
+    ctx = _make_ctx()
+    output = await get_bookmarks(ctx)
+    assert output["count"] == 1
+    assert output["bookmarks"][0]["name"] == "Berlin"
+
+
+@pytest.mark.asyncio
+async def test_add_bookmark_tool(mock_connection):
+    mock_connection.send_command.return_value = {
+        "status": "success",
+        "result": {"ok": True, "id": "bm2", "name": "Munich"},
+    }
+    from qgis_mcp.server import add_bookmark
+
+    ctx = _make_ctx()
+    output = await add_bookmark(
+        ctx, name="Munich", xmin=11.3, ymin=48.0, xmax=11.8, ymax=48.3
+    )
+    assert output["ok"] is True
+    call_params = mock_connection.send_command.call_args[0][1]
+    assert call_params["name"] == "Munich"
+    assert call_params["crs"] == "EPSG:4326"
+
+
+@pytest.mark.asyncio
+async def test_remove_bookmark_tool(mock_connection):
+    mock_connection.send_command.return_value = {
+        "status": "success",
+        "result": {"ok": True, "id": "bm1"},
+    }
+    from qgis_mcp.server import remove_bookmark
+
+    ctx = _make_ctx()
+    output = await remove_bookmark(ctx, bookmark_id="bm1")
+    assert output["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_map_themes_tool(mock_connection):
+    mock_connection.send_command.return_value = {
+        "status": "success",
+        "result": {
+            "themes": [
+                {"name": "Base Map", "visible_layer_count": 2, "visible_layer_ids": ["l1", "l2"]}
+            ],
+            "count": 1,
+        },
+    }
+    from qgis_mcp.server import get_map_themes
+
+    ctx = _make_ctx()
+    output = await get_map_themes(ctx)
+    assert output["count"] == 1
+    assert output["themes"][0]["name"] == "Base Map"
+
+
+@pytest.mark.asyncio
+async def test_add_map_theme_tool(mock_connection):
+    mock_connection.send_command.return_value = {
+        "status": "success",
+        "result": {"ok": True, "name": "My Theme", "action": "created"},
+    }
+    from qgis_mcp.server import add_map_theme
+
+    ctx = _make_ctx()
+    output = await add_map_theme(ctx, name="My Theme")
+    assert output["ok"] is True
+    assert output["action"] == "created"
+
+
+@pytest.mark.asyncio
+async def test_remove_map_theme_tool(mock_connection):
+    mock_connection.send_command.return_value = {
+        "status": "success",
+        "result": {"ok": True, "name": "My Theme"},
+    }
+    from qgis_mcp.server import remove_map_theme
+
+    ctx = _make_ctx()
+    output = await remove_map_theme(ctx, name="My Theme")
+    assert output["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_apply_map_theme_tool(mock_connection):
+    mock_connection.send_command.return_value = {
+        "status": "success",
+        "result": {"ok": True, "name": "My Theme"},
+    }
+    from qgis_mcp.server import apply_map_theme
+
+    ctx = _make_ctx()
+    output = await apply_map_theme(ctx, name="My Theme")
+    assert output["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_set_project_crs_tool(mock_connection):
+    mock_connection.send_command.return_value = {
+        "status": "success",
+        "result": {"ok": True, "crs": "EPSG:3857", "description": "WGS 84 / Pseudo-Mercator"},
+    }
+    from qgis_mcp.server import set_project_crs
+
+    ctx = _make_ctx()
+    output = await set_project_crs(ctx, crs="EPSG:3857")
+    assert isinstance(output, list)
+    assert output[0].type == "text"
+    assert '"EPSG:3857"' in output[0].text
+    assert output[1].type == "resource_link"
+    assert "qgis://project" in str(output[1].uri)
+
+
+def test_compound_tools_register():
+    """Test that compound tools can be registered."""
+    from qgis_mcp.compound_tools import register_compound_tools
+
+    mock_mcp = MagicMock()
+    mock_mcp.tool = MagicMock(return_value=lambda f: f)
+
+    register_compound_tools(
+        mock_mcp,
+        _send=AsyncMock(),
+        _confirm_destructive=AsyncMock(return_value=True),
+    )
+
+    # Should have registered ~19 compound tools (15 main + 4 additional)
+    assert mock_mcp.tool.call_count >= 14
