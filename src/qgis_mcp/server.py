@@ -1342,7 +1342,7 @@ def llms_context_resource() -> str:
 
 ## Overview
 QGIS MCP connects QGIS Desktop to LLMs via the Model Context Protocol.
-51 tools for project management, layer operations, feature editing, styling, processing, and more.
+67 tools for project management, layer operations, feature editing, styling, processing, and more.
 
 ## Quick Start
 1. `ping` — verify connectivity
@@ -1354,14 +1354,16 @@ QGIS MCP connects QGIS Desktop to LLMs via the Model Context Protocol.
 
 ## Tool Categories
 - **Info**: ping, diagnose, get_qgis_info, get_project_info
-- **Project**: load_project, create_new_project, save_project
+- **Project**: load_project, create_new_project, save_project, set_project_crs
 - **Layers**: get_layers, add_vector_layer, add_raster_layer, remove_layer, find_layer, create_memory_layer
+- **Active Layer**: get_active_layer, set_active_layer
 - **Visibility**: set_layer_visibility, zoom_to_layer
 - **Features**: get_layer_features (max 50, filter with expressions), get_field_statistics
 - **Editing**: add_features, update_features, delete_features
 - **Selection**: select_features, get_selection, clear_selection
 - **Styling**: set_layer_style (single/categorized/graduated)
-- **Canvas**: get_canvas_extent, set_canvas_extent, get_canvas_screenshot
+- **Labeling**: get_layer_labeling, set_layer_labeling (field, font_size, color)
+- **Canvas**: get_canvas_extent, set_canvas_extent, get_canvas_screenshot, get_canvas_scale, set_canvas_scale
 - **Raster**: get_raster_info
 - **Processing**: execute_processing, list_processing_algorithms, get_algorithm_help
 - **Rendering**: render_map (re-render to image), get_canvas_screenshot (fast grab)
@@ -1372,10 +1374,19 @@ QGIS MCP connects QGIS Desktop to LLMs via the Model Context Protocol.
 - **Plugins**: list_plugins, get_plugin_info, reload_plugin
 - **Layer Tree**: get_layer_tree, create_layer_group, move_layer_to_group
 - **Properties**: set_layer_property, get_layer_extent
+- **CRS**: get_layer_crs, set_layer_crs, transform_coordinates
 - **Variables**: get_project_variables, set_project_variable
 - **Expression**: validate_expression
 - **Settings**: get_setting, set_setting
-- **CRS**: transform_coordinates
+- **Bookmarks**: get_bookmarks, add_bookmark, remove_bookmark
+- **Map Themes**: get_map_themes, add_map_theme, remove_map_theme, apply_map_theme
+
+## Tips
+- **World basemap**: QGIS ships with a world map. Use `execute_code` with \
+`QgsApplication.pkgDataPath() + "/resources/data/world_map.gpkg"` to get the path, \
+then `add_vector_layer` to load it as a background for spatial context.
+- **Map themes**: save/restore layer visibility presets — useful for toggling between views.
+- **Bookmarks**: save named extents for quick navigation to areas of interest.
 
 ## Key Patterns
 - Layer IDs are used to reference layers (get them from get_layers or find_layer)
