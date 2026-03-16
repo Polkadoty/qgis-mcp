@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -90,11 +91,58 @@ def _client_registry() -> dict[str, ClientInfo]:
 # ── MCP server entry builders ──────────────────────────────────────────────
 
 
+def _venv_python() -> Path:
+    """Return the Python executable inside the project venv."""
+    if sys.platform == "win32":
+        return REPO_DIR / ".venv" / "Scripts" / "python.exe"
+    return REPO_DIR / ".venv" / "bin" / "python"
+
+
+def _is_venv_ready() -> bool:
+    """Check if the venv exists and qgis_mcp is importable."""
+    python = _venv_python()
+    if not python.exists():
+        return False
+    result = subprocess.run(
+        [str(python), "-c", "import qgis_mcp"],
+        capture_output=True,
+    )
+    return result.returncode == 0
+
+
+def setup_venv() -> None:
+    """Create venv and install dependencies, using uv if available, else pip."""
+    if _is_venv_ready():
+        print("  Dependencies already installed.")
+        return
+
+    uv = shutil.which("uv")
+    if uv:
+        print("  Setting up dependencies with uv...")
+        subprocess.run([uv, "sync"], cwd=str(REPO_DIR), check=True)
+    else:
+        print("  uv not found, falling back to pip...")
+        venv_dir = REPO_DIR / ".venv"
+        if not venv_dir.exists():
+            print("  Creating virtual environment...")
+            subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
+        python = str(_venv_python())
+        subprocess.run([python, "-m", "pip", "install", "-e", str(REPO_DIR)], check=True)
+
+    print("  Dependencies installed.")
+
+
 def _local_entry() -> dict:
+    if shutil.which("uv"):
+        return {
+            "command": "uv",
+            "args": ["run", "--no-sync", "src/qgis_mcp/server.py"],
+            "cwd": str(REPO_DIR),
+        }
+    # Fallback: run directly from the venv Python
     return {
-        "command": "uv",
-        "args": ["run", "--no-sync", "src/qgis_mcp/server.py"],
-        "cwd": str(REPO_DIR),
+        "command": str(_venv_python()),
+        "args": [str(REPO_DIR / "src" / "qgis_mcp" / "server.py")],
     }
 
 
@@ -106,10 +154,19 @@ def _remote_entry() -> dict:
 
 
 def _zed_local_entry() -> dict:
+    if shutil.which("uv"):
+        return {
+            "command": {
+                "path": "uv",
+                "args": ["run", "--no-sync", "src/qgis_mcp/server.py"],
+                "env": {"QGIS_MCP_TRANSPORT": "stdio"},
+            },
+            "settings": {},
+        }
     return {
         "command": {
-            "path": "uv",
-            "args": ["run", "--no-sync", "src/qgis_mcp/server.py"],
+            "path": str(_venv_python()),
+            "args": [str(REPO_DIR / "src" / "qgis_mcp" / "server.py")],
             "env": {"QGIS_MCP_TRANSPORT": "stdio"},
         },
         "settings": {},
@@ -207,9 +264,13 @@ def configure_client(client_name: str, remote: bool) -> None:
     if info.get("print_only"):
         if remote:
             cmd = f'claude mcp add qgis -- uvx --from "{GITHUB_URL}" qgis-mcp-server'
-        else:
+        elif shutil.which("uv"):
             cmd = "claude mcp add qgis -- uv run --no-sync src/qgis_mcp/server.py"
             print(f"  Run this from {REPO_DIR}:")
+        else:
+            python = str(_venv_python())
+            server = str(REPO_DIR / "src" / "qgis_mcp" / "server.py")
+            cmd = f'claude mcp add qgis -- "{python}" "{server}"'
         print(f"  {cmd}")
         return
 
@@ -310,11 +371,16 @@ def main() -> None:
 
     # ── Plugin ──
     if args.uninstall:
-        print("[1/2] Removing QGIS plugin...")
+        print("[1/3] Removing QGIS plugin...")
         uninstall_plugin(args.profile)
     else:
-        print("[1/2] Installing QGIS plugin...")
+        print("[1/3] Installing QGIS plugin...")
         install_plugin(args.profile)
+
+    # ── Dependencies (skip for uninstall and remote mode) ──
+    if not args.uninstall and not args.remote:
+        print("\n[2/3] Setting up dependencies...")
+        setup_venv()
 
     # ── Clients ──
     if args.non_interactive:
@@ -330,7 +396,7 @@ def main() -> None:
         sys.exit(f"Unknown clients: {', '.join(invalid)}.  Valid: {', '.join(sorted(valid))}")
 
     if clients:
-        print(f"\n[2/2] {'Removing' if args.uninstall else 'Configuring'} MCP clients...")
+        print(f"\n[3/3] {'Removing' if args.uninstall else 'Configuring'} MCP clients...")
         for client in clients:
             print(f"\n  -- {client} --")
             if args.uninstall:
