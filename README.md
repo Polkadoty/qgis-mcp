@@ -196,4 +196,4 @@ uv run --no-sync pytest tests/test_qgis_live.py -v
 
 ## License
 
-This project is open source. See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+This project is licensed under the GNU GPL v2 or later.
